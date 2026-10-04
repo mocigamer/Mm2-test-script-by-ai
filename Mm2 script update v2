@@ -1,0 +1,870 @@
+-- MM2: usa roles replicados cuando GetPlayerData está disponible.
+-- Alternativa: detecta Knife/Gun visibles; un jugador sin arma no confirma inocencia.
+-- El apuntado no atraviesa paredes ni garantiza impactos: manda el servidor.
+-- No se inventan remotes de disparo; se usa la Tool equipada.
+
+local CONFIG = {
+	Nombre = "hansel puto",
+	IntervaloRoles = 3,
+	IntervaloVisual = 0.25,
+	DistanciaMaxima = 1500,
+	UsarCompatibilidadMouse = true,
+}
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+if not player then return end
+
+local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	or player:WaitForChild("PlayerGui", 8)
+if not playerGui then return end
+
+local env = _G
+if type(getgenv) == "function" then
+	local ok, result = pcall(getgenv)
+	if ok and type(result) == "table" then env = result end
+end
+
+local KEY = "__HanselMM2NativeV3"
+local shared = env[KEY]
+if type(shared) ~= "table" then
+	shared = {}
+	env[KEY] = shared
+end
+
+if shared.controller and type(shared.controller.Destroy) == "function" then
+	pcall(shared.controller.Destroy)
+end
+
+local oldGui = playerGui:FindFirstChild("HanselMM2Native")
+if oldGui then oldGui:Destroy() end
+
+local state = {
+	alive = true,
+	aimGun = false,
+	aimKnife = false,
+	espMurder = false,
+	espSheriff = false,
+	espInnocent = false,
+	autoShoot = false,
+	mouseOverride = nil,
+	manualTarget = nil,
+	busy = false,
+}
+
+local connections, visuals = {}, {}
+local roleCache = {}
+local roleTime = 0
+local rolesRemote
+local fetching = false
+local nextRemoteSearch = 0
+local statusText = "Listo. Equipa un arma para utilizar Aim."
+local statusUntil = 0
+local mouse = player:GetMouse()
+
+local function connect(signal, callback)
+	local connection = signal:Connect(callback)
+	table.insert(connections, connection)
+	return connection
+end
+
+local function instance(className, properties, parent)
+	local object = Instance.new(className)
+	for name, value in pairs(properties) do object[name] = value end
+	object.Parent = parent
+	return object
+end
+
+local colors = {
+	background = Color3.fromRGB(14, 17, 25),
+	panel = Color3.fromRGB(22, 27, 39),
+	card = Color3.fromRGB(30, 36, 51),
+	text = Color3.fromRGB(240, 244, 255),
+	muted = Color3.fromRGB(155, 168, 193),
+	accent = Color3.fromRGB(110, 104, 255),
+	red = Color3.fromRGB(255, 77, 98),
+	blue = Color3.fromRGB(75, 168, 255),
+	green = Color3.fromRGB(71, 219, 159),
+}
+
+local function round(object, radius)
+	instance("UICorner", {CornerRadius = UDim.new(0, radius)}, object)
+end
+
+local function stroke(object, color, transparency)
+	return instance("UIStroke", {
+		Color = color,
+		Transparency = transparency or 0,
+		Thickness = 1,
+	}, object)
+end
+
+local gui = instance("ScreenGui", {
+	Name = "HanselMM2Native",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	DisplayOrder = 100,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+
+local worldFolder = instance("Folder", {
+	Name = "HanselMM2Visuals",
+}, Workspace)
+
+local controller = {state = state}
+shared.controller = controller
+
+controller.Destroy = function()
+	if not state.alive then return end
+	state.alive = false
+	state.mouseOverride = nil
+	state.manualTarget = nil
+	for _, connection in ipairs(connections) do
+		pcall(function() connection:Disconnect() end)
+	end
+	table.clear(connections)
+	for _, item in pairs(visuals) do
+		item.highlight:Destroy()
+		item.billboard:Destroy()
+	end
+	table.clear(visuals)
+	if worldFolder then worldFolder:Destroy() end
+	if gui then gui:Destroy() end
+	if shared.controller == controller then shared.controller = nil end
+end
+
+local function message(text, seconds)
+	statusText = text
+	statusUntil = os.clock() + (seconds or 4)
+end
+
+local function livingCharacter(p)
+	local character = p.Character
+	if not character or not character.Parent then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then
+		return character, root
+	end
+end
+
+local function toolKind(tool)
+	if not tool or not tool:IsA("Tool") then return end
+	local name = string.lower(tool.Name)
+	if name == "knife" then return "knife" end
+	if name == "gun" then return "gun" end
+end
+
+local function equippedTool()
+	local character = player.Character
+	if not character then return end
+	for _, object in ipairs(character:GetChildren()) do
+		local kind = toolKind(object)
+		if kind then return object, kind end
+	end
+end
+
+local function observedWeapon(p)
+	local hasGun = false
+	for _, container in ipairs({p.Character or false, p:FindFirstChildOfClass("Backpack") or false}) do
+		if container then
+			for _, object in ipairs(container:GetChildren()) do
+				local kind = toolKind(object)
+				if kind == "knife" then return "murder" end
+				if kind == "gun" then hasGun = true end
+			end
+		end
+	end
+	if hasGun then return "sheriff" end
+end
+
+local function normalizeRole(role)
+	if type(role) ~= "string" then return end
+	role = string.lower(role)
+	if role == "murderer" or role == "murder" then return "murder" end
+	if role == "sheriff" or role == "hero" then return "sheriff" end
+	if role == "innocent" then return "innocent" end
+end
+
+local function getRole(p)
+	local observed = observedWeapon(p)
+	if observed then return observed, true end
+	if os.clock() - roleTime < CONFIG.IntervaloRoles * 3 then
+		local role = roleCache[p.UserId]
+		if role then return role, true end
+	end
+	return "unknown", false
+end
+
+local function refreshRoles()
+	if fetching or not state.alive then return end
+	if not rolesRemote or not rolesRemote:IsDescendantOf(ReplicatedStorage) then
+		if os.clock() < nextRemoteSearch then return end
+		nextRemoteSearch = os.clock() + 10
+		rolesRemote = nil
+		local candidate = ReplicatedStorage:FindFirstChild("GetPlayerData", true)
+		if candidate and candidate:IsA("RemoteFunction") then
+			rolesRemote = candidate
+		end
+	end
+	if not rolesRemote then return end
+
+	-- Una sola petición pendiente: no acumula hilos si el servidor no responde.
+	fetching = true
+	task.spawn(function()
+		local ok, data = pcall(function()
+			return rolesRemote:InvokeServer()
+		end)
+		fetching = false
+		if not state.alive then return end
+		if ok and type(data) == "table" then
+			local nextCache = {}
+			for _, p in ipairs(Players:GetPlayers()) do
+				local entry = data[p.Name] or data[p.UserId] or data[tostring(p.UserId)]
+				if type(entry) == "table" then
+					nextCache[p.UserId] = normalizeRole(entry.Role)
+				end
+			end
+			roleCache = nextCache
+			roleTime = os.clock()
+		end
+	end)
+end
+
+local function targetPart(p)
+	local character = livingCharacter(p)
+	if not character then return end
+	local part = character:FindFirstChild("UpperTorso")
+		or character:FindFirstChild("Torso")
+		or character:FindFirstChild("HumanoidRootPart")
+	if part and part:IsA("BasePart") then return part end
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+
+local function visible(part)
+	local camera = Workspace.CurrentCamera
+	if not camera or not part or not part.Parent then return false end
+	local origin = camera.CFrame.Position
+	local direction = part.Position - origin
+	if direction.Magnitude > CONFIG.DistanciaMaxima then return false end
+	rayParams.FilterDescendantsInstances = {
+		player.Character or camera,
+		camera,
+		worldFolder,
+	}
+	local result = Workspace:Raycast(origin, direction, rayParams)
+	return not result or result.Instance:IsDescendantOf(part.Parent)
+end
+
+local function selectTarget(kind)
+	local camera = Workspace.CurrentCamera
+	if not camera or not livingCharacter(player) then return end
+	local center = camera.ViewportSize / 2
+	local bestPart, bestPlayer
+	local bestScore = math.huge
+
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player then
+			local role = getRole(p)
+			local eligible = kind == "knife" or (kind == "gun" and role == "murder")
+			if eligible then
+				local part = targetPart(p)
+				if part and visible(part) then
+					local screen, onScreen = camera:WorldToViewportPoint(part.Position)
+					local distance = (part.Position - camera.CFrame.Position).Magnitude
+					local score = distance
+					if onScreen then
+						score = (Vector2.new(screen.X, screen.Y) - center).Magnitude + distance * 0.15
+					else
+						score = 10000 + distance
+					end
+					if score < bestScore then
+						bestScore, bestPart, bestPlayer = score, part, p
+					end
+				end
+			end
+		end
+	end
+	return bestPart, bestPlayer
+end
+
+-- Compatibilidad opcional con armas que consultan Mouse.Hit/Target.
+-- El hook se instala una sola vez y queda inactivo al cerrar la interfaz.
+if CONFIG.UsarCompatibilidadMouse and not shared.mouseHook
+	and type(hookmetamethod) == "function" then
+	local previous
+	local function indexHook(object, key)
+		local current = shared.controller
+		local s = current and current.state
+		local part = s and s.alive and s.mouseOverride
+		local internal = false
+		if type(checkcaller) == "function" then internal = checkcaller() end
+		if not internal and part and object == mouse
+			and (key == "Hit" or key == "Target" or key == "UnitRay") then
+			if part.Parent then
+				if key == "Target" then return part end
+				if key == "Hit" then return CFrame.new(part.Position) end
+				local camera = Workspace.CurrentCamera
+				if camera then
+					local delta = part.Position - camera.CFrame.Position
+					if delta.Magnitude > 0.001 then
+						return Ray.new(camera.CFrame.Position, delta.Unit)
+					end
+				end
+			end
+		end
+		return previous(object, key)
+	end
+
+	local ok = pcall(function()
+		local callback = indexHook
+		if type(newcclosure) == "function" then callback = newcclosure(callback) end
+		previous = hookmetamethod(game, "__index", callback)
+	end)
+	if ok and type(previous) == "function" then
+		shared.mouseHook = true
+	end
+end
+
+local function aimAt(part)
+	local camera = Workspace.CurrentCamera
+	if not camera or not part or not part.Parent then return false end
+	local origin = camera.CFrame.Position
+	if (part.Position - origin).Magnitude < 0.01 then return false end
+	camera.CFrame = CFrame.lookAt(origin, part.Position)
+	return true
+end
+
+local function shootMurderer()
+	if not state.autoShoot or state.busy then return end
+	if not livingCharacter(player) then
+		message("Tu personaje no está activo.")
+		return
+	end
+	local tool, kind = equippedTool()
+	if kind ~= "gun" then
+		message("Equipa la Gun del sheriff antes de disparar.")
+		return
+	end
+	if not tool.Enabled then
+		message("La pistola está recargando o no está habilitada.")
+		return
+	end
+	local part, target = selectTarget("gun")
+	if not part then
+		message("No hay un murderer confirmado con línea de visión.")
+		return
+	end
+
+	state.busy = true
+	state.manualTarget = part
+	state.mouseOverride = part
+	aimAt(part)
+
+	task.spawn(function()
+		-- Da tiempo a la cámara y al arma para actualizar la dirección.
+		task.wait(0.06)
+		if not state.alive then return end
+		local current, currentKind = equippedTool()
+		if not state.autoShoot or current ~= tool or currentKind ~= "gun"
+			or not part.Parent or not targetPart(target) or not visible(part) then
+			state.manualTarget = nil
+			state.mouseOverride = nil
+			state.busy = false
+			message("Disparo cancelado: cambió el arma o se perdió el objetivo.")
+			return
+		end
+
+		aimAt(part)
+		local ok = pcall(function() tool:Activate() end)
+		if ok then
+			message("Activación enviada hacia " .. target.DisplayName .. ". El servidor valida el impacto.")
+		else
+			message("El arma no aceptó Tool:Activate() en este cliente.")
+		end
+		task.wait(0.16)
+		pcall(function()
+			if tool.Parent then tool:Deactivate() end
+		end)
+		state.manualTarget = nil
+		state.mouseOverride = nil
+		state.busy = false
+	end)
+end
+
+local window = instance("Frame", {
+	Name = "Window",
+	Size = UDim2.fromOffset(530, 404),
+	Position = UDim2.new(0.5, -265, 0.5, -202),
+	BackgroundColor3 = colors.background,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+}, gui)
+round(window, 18)
+stroke(window, Color3.fromRGB(69, 77, 103), 0.25)
+
+local scale = instance("UIScale", {Scale = 1}, window)
+local header = instance("Frame", {
+	Size = UDim2.new(1, 0, 0, 78),
+	BackgroundColor3 = colors.panel,
+	BorderSizePixel = 0,
+	Active = true,
+}, window)
+
+local function label(parent, text, position, size, fontSize, color)
+	return instance("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = position,
+		Size = size,
+		Text = text,
+		TextColor3 = color or colors.text,
+		TextSize = fontSize,
+		Font = Enum.Font.GothamMedium,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, parent)
+end
+
+label(header, "H", UDim2.fromOffset(18, 16), UDim2.fromOffset(40, 42), 31, colors.accent)
+label(header, CONFIG.Nombre, UDim2.fromOffset(65, 17), UDim2.fromOffset(320, 26), 22)
+label(header, "MM2  /  NATIVE CONTROL", UDim2.fromOffset(66, 46), UDim2.fromOffset(310, 16), 10, colors.muted)
+
+local function smallButton(parent, text, position)
+	local b = instance("TextButton", {
+		Position = position,
+		Size = UDim2.fromOffset(35, 35),
+		BackgroundColor3 = colors.card,
+		Text = text,
+		TextColor3 = colors.text,
+		TextSize = 19,
+		Font = Enum.Font.GothamBold,
+		BorderSizePixel = 0,
+		AutoButtonColor = true,
+	}, parent)
+	round(b, 10)
+	return b
+end
+
+local minimize = smallButton(header, "–", UDim2.new(1, -94, 0, 21))
+local close = smallButton(header, "×", UDim2.new(1, -51, 0, 21))
+connect(close.Activated, controller.Destroy)
+
+local tabBar = instance("Frame", {
+	Position = UDim2.fromOffset(16, 89),
+	Size = UDim2.new(1, -32, 0, 39),
+	BackgroundTransparency = 1,
+}, window)
+
+local content = instance("Frame", {
+	Position = UDim2.fromOffset(16, 140),
+	Size = UDim2.new(1, -32, 0, 184),
+	BackgroundTransparency = 1,
+}, window)
+
+local footer = label(window, "", UDim2.fromOffset(20, 335), UDim2.new(1, -40, 0, 54), 11, colors.muted)
+footer.TextWrapped = true
+footer.TextYAlignment = Enum.TextYAlignment.Top
+
+local reopen = instance("TextButton", {
+	Size = UDim2.fromOffset(56, 56),
+	Position = UDim2.fromOffset(20, 180),
+	BackgroundColor3 = colors.panel,
+	BorderSizePixel = 0,
+	Text = "H",
+	TextColor3 = colors.accent,
+	TextSize = 27,
+	Font = Enum.Font.GothamBold,
+	Visible = false,
+}, gui)
+round(reopen, 18)
+stroke(reopen, colors.accent, 0.15)
+
+connect(minimize.Activated, function()
+	window.Visible = false
+	reopen.Visible = true
+end)
+
+local shootButton = instance("TextButton", {
+	Name = "ShootMurderer",
+	Size = UDim2.fromOffset(76, 76),
+	Position = UDim2.new(1, -104, 0.55, -38),
+	BackgroundColor3 = Color3.fromRGB(38, 18, 25),
+	BorderSizePixel = 0,
+	Text = "",
+	Visible = false,
+	AutoButtonColor = true,
+}, gui)
+round(shootButton, 38)
+stroke(shootButton, colors.red, 0.05)
+
+local ring = instance("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(32, 32),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+}, shootButton)
+round(ring, 16)
+local ringStroke = stroke(ring, colors.red)
+ringStroke.Thickness = 2
+
+for _, geometry in ipairs({
+	{36, 13, 4, 17}, {36, 46, 4, 17},
+	{13, 36, 17, 4}, {46, 36, 17, 4},
+	{35, 35, 6, 6},
+}) do
+	local line = instance("Frame", {
+		Position = UDim2.fromOffset(geometry[1], geometry[2]),
+		Size = UDim2.fromOffset(geometry[3], geometry[4]),
+		BackgroundColor3 = colors.red,
+		BorderSizePixel = 0,
+	}, shootButton)
+	round(line, 2)
+end
+
+local function viewport()
+	local camera = Workspace.CurrentCamera
+	return camera and camera.ViewportSize or Vector2.new(800, 600)
+end
+
+local function clampObject(object)
+	local size = viewport()
+	local position, dimensions = object.AbsolutePosition, object.AbsoluteSize
+	object.Position = UDim2.fromOffset(
+		math.clamp(position.X, 4, math.max(4, size.X - dimensions.X - 4)),
+		math.clamp(position.Y, 4, math.max(4, size.Y - dimensions.Y - 4))
+	)
+end
+
+local function draggable(handle, object, onClick)
+	local activeInput, startPointer, startPosition
+	local moved = false
+	local lastDrag = -math.huge
+
+	connect(handle.InputBegan, function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1
+			and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		if activeInput then return end
+		activeInput = input
+		startPointer = Vector2.new(input.Position.X, input.Position.Y)
+		startPosition = object.AbsolutePosition
+		moved = false
+	end)
+
+	connect(UserInputService.InputChanged, function(input)
+		if not activeInput then return end
+		local touch = activeInput.UserInputType == Enum.UserInputType.Touch
+		if (touch and input ~= activeInput)
+			or (not touch and input.UserInputType ~= Enum.UserInputType.MouseMovement) then return end
+		local delta = Vector2.new(input.Position.X, input.Position.Y) - startPointer
+		if delta.Magnitude > 7 then moved = true end
+		if moved then
+			local position = startPosition + delta
+			local dimensions = object.AbsoluteSize
+			local view = viewport()
+			object.Position = UDim2.fromOffset(
+				math.clamp(position.X, 4, math.max(4, view.X - dimensions.X - 4)),
+				math.clamp(position.Y, 4, math.max(4, view.Y - dimensions.Y - 4))
+			)
+		end
+	end)
+
+	connect(UserInputService.InputEnded, function(input)
+		if input == activeInput then
+			if moved then lastDrag = os.clock() end
+			activeInput = nil
+		end
+	end)
+
+	if onClick then
+		connect(handle.Activated, function()
+			if not moved and os.clock() - lastDrag > 0.2 then onClick() end
+		end)
+	end
+end
+
+draggable(header, window)
+draggable(reopen, reopen, function()
+	window.Visible = true
+	reopen.Visible = false
+end)
+draggable(shootButton, shootButton, shootMurderer)
+
+local pages, tabs = {}, {}
+local selectedTab = "Aim"
+
+for index, name in ipairs({"Aim", "Visual", "Auto"}) do
+	local button = instance("TextButton", {
+		Position = UDim2.new((index - 1) / 3, 3, 0, 0),
+		Size = UDim2.new(1 / 3, -6, 1, 0),
+		BackgroundColor3 = colors.card,
+		Text = name,
+		TextColor3 = colors.muted,
+		TextSize = 13,
+		Font = Enum.Font.GothamBold,
+		BorderSizePixel = 0,
+	}, tabBar)
+	round(button, 10)
+	tabs[name] = button
+
+	local page = instance("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Visible = name == selectedTab,
+	}, content)
+	pages[name] = page
+	instance("UIListLayout", {
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, page)
+
+	connect(button.Activated, function()
+		selectedTab = name
+		for tabName, tab in pairs(tabs) do
+			local selected = tabName == name
+			tab.BackgroundColor3 = selected and colors.accent or colors.card
+			tab.TextColor3 = selected and colors.text or colors.muted
+			pages[tabName].Visible = selected
+		end
+	end)
+end
+tabs.Aim.BackgroundColor3 = colors.accent
+tabs.Aim.TextColor3 = colors.text
+
+local function toggle(pageName, title, subtitle, key, callback)
+	local row = instance("TextButton", {
+		Size = UDim2.new(1, 0, 0, 54),
+		BackgroundColor3 = colors.card,
+		Text = "",
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+	}, pages[pageName])
+	round(row, 11)
+	label(row, title, UDim2.fromOffset(14, 8), UDim2.new(1, -90, 0, 19), 13)
+	label(row, subtitle, UDim2.fromOffset(14, 30), UDim2.new(1, -90, 0, 16), 10, colors.muted)
+
+	local track = instance("Frame", {
+		Position = UDim2.new(1, -63, 0.5, -13),
+		Size = UDim2.fromOffset(48, 26),
+		BackgroundColor3 = Color3.fromRGB(63, 72, 92),
+		BorderSizePixel = 0,
+	}, row)
+	round(track, 13)
+
+	local knob = instance("Frame", {
+		Position = UDim2.fromOffset(4, 4),
+		Size = UDim2.fromOffset(18, 18),
+		BackgroundColor3 = colors.text,
+		BorderSizePixel = 0,
+	}, track)
+	round(knob, 9)
+
+	connect(row.Activated, function()
+		state[key] = not state[key]
+		track.BackgroundColor3 = state[key] and colors.accent or Color3.fromRGB(63, 72, 92)
+		knob.Position = UDim2.fromOffset(state[key] and 26 or 4, 4)
+		if callback then callback(state[key]) end
+	end)
+end
+
+toggle("Aim", "Aimbot gun", "Con Gun equipada: apunta al murderer visible.", "aimGun")
+toggle("Aim", "Aimbot knife", "Con Knife equipada: apunta a otro jugador visible.", "aimKnife")
+toggle("Visual", "ESP murder", "Rojo · rol replicado o Knife detectada.", "espMurder")
+toggle("Visual", "ESP sheriff", "Azul · incluye al jugador que recoge la Gun.", "espSheriff")
+toggle("Visual", "ESP inocente", "Verde confirmado; gris si el rol es desconocido.", "espInnocent")
+toggle("Auto", "Auto shoot murderer", "Muestra una mira roja móvil. Tócala para disparar.", "autoShoot", function(enabled)
+	shootButton.Visible = enabled
+	if not enabled then
+		state.manualTarget = nil
+		state.mouseOverride = nil
+	end
+	message(enabled
+		and "Arrastra la mira roja; tócala sin arrastrar con Gun equipada."
+		or "Botón de disparo desactivado.")
+end)
+
+local note = label(pages.Auto,
+	"Un toque solicita un disparo; no es fuego continuo.\nNecesita un murderer identificado y sin obstáculos.\nTool:Activate() depende del arma; no hay garantía de impacto.",
+	UDim2.new(), UDim2.new(1, -10, 0, 84), 12, colors.muted)
+note.TextWrapped = true
+note.TextYAlignment = Enum.TextYAlignment.Center
+
+local function removeVisual(p)
+	local item = visuals[p]
+	if item then
+		item.highlight:Destroy()
+		item.billboard:Destroy()
+		visuals[p] = nil
+	end
+end
+
+local function updateVisuals()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player then
+			local character, root = livingCharacter(p)
+			local role, confirmed = getRole(p)
+			local enabled = (role == "murder" and state.espMurder)
+				or (role == "sheriff" and state.espSheriff)
+				or ((role == "innocent" or role == "unknown") and state.espInnocent)
+
+			if not enabled or not character then
+				removeVisual(p)
+			else
+				local item = visuals[p]
+				if item and item.character ~= character then
+					removeVisual(p)
+					item = nil
+				end
+				if not item then
+					local highlight = instance("Highlight", {
+						Adornee = character,
+						DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+						FillTransparency = 0.72,
+						OutlineTransparency = 0.12,
+					}, worldFolder)
+
+					local billboard = instance("BillboardGui", {
+						Adornee = root,
+						Size = UDim2.fromOffset(230, 45),
+						StudsOffset = Vector3.new(0, 3.3, 0),
+						AlwaysOnTop = true,
+						MaxDistance = CONFIG.DistanciaMaxima,
+					}, gui)
+					local text = label(billboard, "", UDim2.new(), UDim2.fromScale(1, 1), 11)
+					text.TextXAlignment = Enum.TextXAlignment.Center
+					text.TextStrokeTransparency = 0.3
+					text.TextStrokeColor3 = Color3.new(0, 0, 0)
+					item = {
+						character = character,
+						highlight = highlight,
+						billboard = billboard,
+						text = text,
+					}
+					visuals[p] = item
+				end
+
+				local color, roleLabel
+				if role == "murder" then
+					color, roleLabel = colors.red, "MURDERER"
+				elseif role == "sheriff" then
+					color, roleLabel = colors.blue, "SHERIFF / GUN"
+				elseif confirmed then
+					color, roleLabel = colors.green, "INOCENTE"
+				else
+					color, roleLabel = colors.muted, "ROL NO CONFIRMADO"
+				end
+				item.highlight.FillColor = color
+				item.highlight.OutlineColor = color
+				item.text.TextColor3 = color
+				item.text.Text = roleLabel .. "\n" .. p.DisplayName
+			end
+		end
+	end
+end
+
+connect(Players.PlayerRemoving, function(p)
+	removeVisual(p)
+	roleCache[p.UserId] = nil
+end)
+
+connect(player.CharacterAdded, function()
+	state.manualTarget = nil
+	state.mouseOverride = nil
+	message("Personaje actualizado. Los controles conservan su estado.")
+end)
+
+local bindName = "HanselMM2Aim_" .. tostring(player.UserId)
+pcall(function() RunService:UnbindFromRenderStep(bindName) end)
+
+RunService:BindToRenderStep(bindName, Enum.RenderPriority.Camera.Value + 1, function()
+	if not state.alive then return end
+	local tool, kind = equippedTool()
+	local part = state.manualTarget
+
+	if not livingCharacter(player) then
+		part = nil
+	elseif not part then
+		if tool and ((kind == "gun" and state.aimGun)
+			or (kind == "knife" and state.aimKnife)) then
+			part = selectTarget(kind)
+		end
+	end
+
+	if part and part.Parent and visible(part) then
+		state.mouseOverride = part
+		aimAt(part)
+	else
+		state.mouseOverride = nil
+	end
+end)
+
+local baseDestroy = controller.Destroy
+controller.Destroy = function()
+	pcall(function() RunService:UnbindFromRenderStep(bindName) end)
+	baseDestroy()
+end
+-- El botón conserva una función que también retira el render binding.
+connect(gui.Destroying, function()
+	if state.alive then controller.Destroy() end
+end)
+
+local elapsedVisual, elapsedRoles, elapsedLayout = 0, CONFIG.IntervaloRoles, 1
+local lastViewport = Vector2.zero
+
+connect(RunService.Heartbeat, function(dt)
+	if not state.alive then return end
+	elapsedVisual += dt
+	elapsedRoles += dt
+	elapsedLayout += dt
+
+	if elapsedRoles >= CONFIG.IntervaloRoles then
+		elapsedRoles = 0
+		refreshRoles()
+	end
+
+	if elapsedVisual >= CONFIG.IntervaloVisual then
+		elapsedVisual = 0
+		updateVisuals()
+		if os.clock() >= statusUntil then
+			local source = os.clock() - roleTime < CONFIG.IntervaloRoles * 3
+				and next(roleCache) ~= nil
+				and "Roles replicados"
+				or "Detección por armas; roles ocultos no confirmados"
+			local mode = shared.mouseHook and "Mouse + cámara" or "Solo cámara"
+			statusText = source .. "  •  " .. mode
+				.. "\nAim requiere el arma equipada. El disparo depende del arma y del servidor."
+		end
+		footer.Text = statusText
+		shootButton.BackgroundColor3 = state.busy
+			and Color3.fromRGB(85, 30, 43)
+			or Color3.fromRGB(38, 18, 25)
+	end
+
+	if elapsedLayout >= 0.5 then
+		elapsedLayout = 0
+		local size = viewport()
+		if size ~= lastViewport then
+			lastViewport = size
+			scale.Scale = math.min(1, math.max(0.35,
+				math.min((size.X - 24) / 530, (size.Y - 24) / 404)))
+			task.defer(function()
+				if not state.alive then return end
+				clampObject(window)
+				clampObject(reopen)
+				clampObject(shootButton)
+			end)
+		end
+	end
+end)
+
+-- Corrige el cierre para desconectar también el callback de cámara.
+connect(close.Activated, function()
+	pcall(function() RunService:UnbindFromRenderStep(bindName) end)
+end)
