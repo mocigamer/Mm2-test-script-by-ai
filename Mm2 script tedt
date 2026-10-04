@@ -1,0 +1,525 @@
+-- MM2: asistencia de cámara y ESP mediante herramientas replicadas.
+-- No modifica impactos, alcance ni remotes: dispara o lanza manualmente.
+-- Los roles ocultos por el servidor no pueden confirmarse desde el cliente.
+local CONFIG = {
+	Nombre = "hansel puto",
+	HerramientasMurder = { "Knife" },
+	HerramientasSheriff = { "Gun" },
+	RadioAim = 210, -- Píxeles desde el centro de la pantalla.
+	Suavidad = 15,
+	PrediccionGun = 0.045,
+	PrediccionKnife = 0,
+	ComprobarParedes = true,
+	IntervaloESP = 0.25,
+}
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+if not player then return end
+
+local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	or player:WaitForChild("PlayerGui", 10)
+if not playerGui then return end
+
+local ENV = _G
+if type(getgenv) == "function" then
+	local ok, result = pcall(getgenv)
+	if ok and type(result) == "table" then ENV = result end
+end
+
+local KEY = "__HanselMM2Native"
+local GUI_NAME = "HanselMM2Native"
+
+local previous = ENV[KEY]
+if type(previous) == "table" and type(previous.Destroy) == "function" then
+	pcall(previous.Destroy)
+end
+
+local oldGui = playerGui:FindFirstChild(GUI_NAME)
+if oldGui then
+	local shutdown = oldGui:FindFirstChild("Shutdown")
+	if shutdown and shutdown:IsA("BindableEvent") then
+		shutdown:Fire()
+	end
+	if oldGui.Parent then oldGui:Destroy() end
+end
+
+local state = {
+	Gun = false,
+	Knife = false,
+	Murder = false,
+	Sheriff = false,
+	Innocent = false,
+}
+local connections, effects, records = {}, {}, {}
+local alive = true
+local runtime = {}
+ENV[KEY] = runtime
+
+local C = {
+	Background = Color3.fromRGB(15, 17, 25),
+	Panel = Color3.fromRGB(23, 26, 38),
+	Card = Color3.fromRGB(30, 34, 48),
+	Text = Color3.fromRGB(239, 241, 250),
+	Muted = Color3.fromRGB(147, 157, 179),
+	Accent = Color3.fromRGB(137, 116, 255),
+	Murder = Color3.fromRGB(255, 87, 112),
+	Sheriff = Color3.fromRGB(83, 177, 255),
+	Innocent = Color3.fromRGB(86, 223, 161),
+}
+
+local function create(class, properties, parent)
+	local object = Instance.new(class)
+	for key, value in pairs(properties or {}) do object[key] = value end
+	object.Parent = parent
+	return object
+end
+
+local function connect(signal, callback)
+	local connection = signal:Connect(callback)
+	table.insert(connections, connection)
+	return connection
+end
+
+local function corner(object, radius)
+	create("UICorner", { CornerRadius = UDim.new(0, radius or 12) }, object)
+end
+
+local function label(parent, text, position, size, fontSize, color)
+	return create("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = position,
+		Size = size,
+		Text = text,
+		TextColor3 = color or C.Text,
+		TextSize = fontSize or 14,
+		Font = Enum.Font.Gotham,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true,
+	}, parent)
+end
+
+local function button(parent, text, position, size)
+	local result = create("TextButton", {
+		Position = position,
+		Size = size,
+		BackgroundColor3 = C.Card,
+		BorderSizePixel = 0,
+		Text = text,
+		TextColor3 = C.Text,
+		TextSize = 14,
+		Font = Enum.Font.GothamMedium,
+		AutoButtonColor = false,
+	}, parent)
+	corner(result, 10)
+	return result
+end
+
+local gui = create("ScreenGui", {
+	Name = GUI_NAME,
+	ResetOnSpawn = false,
+	IgnoreGuiInset = false,
+	DisplayOrder = 150,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+
+local shutdown = create("BindableEvent", { Name = "Shutdown" }, gui)
+local visualFolder = create("Folder", { Name = "LocalRoleESP" }, gui)
+
+local window = create("Frame", {
+	Name = "Window",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(454, 420),
+	BackgroundColor3 = C.Background,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+}, gui)
+corner(window, 18)
+create("UIStroke", {
+	Color = Color3.fromRGB(64, 61, 91),
+	Transparency = 0.18,
+	Thickness = 1,
+}, window)
+
+local scale = create("UIScale", { Scale = 1 }, window)
+local top = create("Frame", {
+	Size = UDim2.new(1, 0, 0, 70),
+	BackgroundColor3 = C.Panel,
+	BorderSizePixel = 0,
+	Active = true,
+}, window)
+
+local title = label(top, CONFIG.Nombre, UDim2.fromOffset(19, 12),
+	UDim2.new(1, -128, 0, 25), 21)
+title.Font = Enum.Font.GothamBold
+label(top, "MM2  /  NATIVE CLIENT", UDim2.fromOffset(20, 40),
+	UDim2.new(1, -128, 0, 17), 10, C.Accent)
+
+local minimize = button(top, "−", UDim2.new(1, -91, 0, 17), UDim2.fromOffset(32, 32))
+local close = button(top, "×", UDim2.new(1, -49, 0, 17), UDim2.fromOffset(32, 32))
+close.TextColor3 = C.Murder
+
+local body = create("Frame", {
+	Position = UDim2.fromOffset(0, 70),
+	Size = UDim2.new(1, 0, 1, -70),
+	BackgroundTransparency = 1,
+}, window)
+
+local aimTab = button(body, "Aim", UDim2.fromOffset(16, 12), UDim2.fromOffset(207, 38))
+local visualTab = button(body, "Visual", UDim2.fromOffset(231, 12), UDim2.fromOffset(207, 38))
+
+local function page()
+	local p = create("ScrollingFrame", {
+		Position = UDim2.fromOffset(16, 62),
+		Size = UDim2.new(1, -32, 1, -119),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = C.Accent,
+	}, body)
+	create("UIListLayout", {
+		Padding = UDim.new(0, 9),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, p)
+	create("UIPadding", { PaddingBottom = UDim.new(0, 5) }, p)
+	return p
+end
+
+local aimPage, visualPage = page(), page()
+local footer = label(body, "Preparando lectura local…", UDim2.new(0, 18, 1, -49),
+	UDim2.new(1, -36, 0, 40), 11, C.Muted)
+
+local refreshVisuals
+local function toggle(parent, key, text, detail, color)
+	local row = button(parent, "", UDim2.new(), UDim2.new(1, -6, 0, 65))
+	row.BackgroundColor3 = C.Card
+	label(row, text, UDim2.fromOffset(13, 9), UDim2.new(1, -93, 0, 22), 14)
+	label(row, detail, UDim2.fromOffset(13, 33), UDim2.new(1, -92, 0, 24), 10, C.Muted)
+
+	local track = create("Frame", {
+		Position = UDim2.new(1, -63, 0.5, -13),
+		Size = UDim2.fromOffset(48, 26),
+		BackgroundColor3 = Color3.fromRGB(55, 60, 77),
+		BorderSizePixel = 0,
+	}, row)
+	corner(track, 13)
+	local dot = create("Frame", {
+		Position = UDim2.fromOffset(3, 3),
+		Size = UDim2.fromOffset(20, 20),
+		BackgroundColor3 = C.Text,
+		BorderSizePixel = 0,
+	}, track)
+	corner(dot, 10)
+
+	connect(row.Activated, function()
+		state[key] = not state[key]
+		TweenService:Create(track, TweenInfo.new(0.15), {
+			BackgroundColor3 = state[key] and color or Color3.fromRGB(55, 60, 77),
+		}):Play()
+		TweenService:Create(dot, TweenInfo.new(0.15), {
+			Position = UDim2.fromOffset(state[key] and 25 or 3, 3),
+		}):Play()
+		if refreshVisuals then refreshVisuals() end
+	end)
+end
+
+toggle(aimPage, "Gun", "Aimbot gun", "Apunta al murder detectado al equipar Gun.", C.Accent)
+toggle(aimPage, "Knife", "Aimbot knife", "Apunta a otros jugadores al equipar Knife.", C.Accent)
+local aimNote = label(aimPage,
+	"Apuntado automático de cámara dentro del radio central. Dispara o lanza manualmente; no amplía el alcance del cuchillo.",
+	UDim2.new(), UDim2.new(1, -12, 0, 64), 11, C.Muted)
+aimNote.TextYAlignment = Enum.TextYAlignment.Top
+
+toggle(visualPage, "Murder", "ESP murder", "Rojo · jugador con Knife visible al cliente.", C.Murder)
+toggle(visualPage, "Sheriff", "ESP sheriff", "Azul · portador de Gun, incluido el héroe.", C.Sheriff)
+toggle(visualPage, "Innocent", "ESP inocente", "Verde · sin arma detectada; rol no confirmado.", C.Innocent)
+
+local function selectTab(isAim)
+	aimPage.Visible = isAim
+	visualPage.Visible = not isAim
+	aimTab.BackgroundColor3 = isAim and C.Accent or C.Card
+	visualTab.BackgroundColor3 = not isAim and C.Accent or C.Card
+end
+connect(aimTab.Activated, function() selectTab(true) end)
+connect(visualTab.Activated, function() selectTab(false) end)
+selectTab(true)
+
+local collapsed = false
+connect(minimize.Activated, function()
+	collapsed = not collapsed
+	body.Visible = not collapsed
+	window.Size = UDim2.fromOffset(454, collapsed and 70 or 420)
+	minimize.Text = collapsed and "+" or "−"
+end)
+
+-- Arrastre táctil y con ratón.
+local dragInput, dragStart, dragPosition
+connect(top.InputBegan, function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		local rightEdge = top.AbsolutePosition.X + top.AbsoluteSize.X - 104 * scale.Scale
+		if input.Position.X >= rightEdge then return end
+		dragInput = input
+		dragStart = Vector2.new(input.Position.X, input.Position.Y)
+		dragPosition = window.Position
+	end
+end)
+connect(UIS.InputChanged, function(input)
+	if not dragInput then return end
+	local touch = dragInput.UserInputType == Enum.UserInputType.Touch
+	if (touch and input ~= dragInput)
+		or (not touch and input.UserInputType ~= Enum.UserInputType.MouseMovement) then return end
+	local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+	local camera = Workspace.CurrentCamera
+	if not camera then return end
+	local viewport = camera.ViewportSize
+	local x = dragPosition.X.Scale * viewport.X + dragPosition.X.Offset + delta.X
+	local y = dragPosition.Y.Scale * viewport.Y + dragPosition.Y.Offset + delta.Y
+	x = math.clamp(x, 50, math.max(50, viewport.X - 50))
+	y = math.clamp(y, 35, math.max(35, viewport.Y - 35))
+	window.Position = UDim2.fromOffset(x, y)
+end)
+connect(UIS.InputEnded, function(input)
+	if input == dragInput then dragInput = nil end
+end)
+
+local murderNames, sheriffNames = {}, {}
+for _, name in ipairs(CONFIG.HerramientasMurder) do murderNames[string.lower(name)] = true end
+for _, name in ipairs(CONFIG.HerramientasSheriff) do sheriffNames[string.lower(name)] = true end
+
+local function weaponRole(container)
+	if not container then return nil end
+	local gun = false
+	for _, object in ipairs(container:GetChildren()) do
+		if object:IsA("Tool") then
+			local name = string.lower(object.Name)
+			if murderNames[name] then return "Murder" end
+			if sheriffNames[name] then gun = true end
+		end
+	end
+	return gun and "Sheriff" or nil
+end
+
+local function livingCharacter(p)
+	local character = p.Character
+	if not character or not character:IsDescendantOf(Workspace) then return nil end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or humanoid.Health <= 0 or not root or not root:IsA("BasePart") then
+		return nil
+	end
+	return character, root
+end
+
+local function removeEffect(p)
+	local effect = effects[p]
+	if not effect then return end
+	effect.Highlight:Destroy()
+	effect.Billboard:Destroy()
+	effects[p] = nil
+end
+
+local roleLabels = {
+	Murder = "MURDER",
+	Sheriff = "SHERIFF / GUN",
+	Innocent = "INOCENTE?",
+}
+
+refreshVisuals = function()
+	if not alive then return end
+	local newRecords, seen = {}, {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player then
+			local character, root = livingCharacter(p)
+			if character then
+				local equipped = weaponRole(character)
+				local backpack = weaponRole(p:FindFirstChildOfClass("Backpack"))
+				local role = (equipped == "Murder" or backpack == "Murder") and "Murder"
+					or equipped or backpack or "Innocent"
+				newRecords[p] = { Character = character, Root = root, Role = role }
+				if state[role] then
+					seen[p] = true
+					local effect = effects[p]
+					if effect and effect.Character ~= character then
+						removeEffect(p)
+						effect = nil
+					end
+					if not effect then
+						local highlight = create("Highlight", {
+							Adornee = character,
+							DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+							FillTransparency = 0.73,
+							OutlineTransparency = 0.05,
+						}, visualFolder)
+						local billboard = create("BillboardGui", {
+							Adornee = root,
+							Size = UDim2.fromOffset(190, 44),
+							StudsOffsetWorldSpace = Vector3.new(0, 3.3, 0),
+							AlwaysOnTop = true,
+							MaxDistance = 1500,
+						}, visualFolder)
+						local text = label(billboard, "", UDim2.new(), UDim2.fromScale(1, 1), 12)
+						text.Font = Enum.Font.GothamBold
+						text.TextXAlignment = Enum.TextXAlignment.Center
+						text.TextStrokeTransparency = 0.25
+						effect = {
+							Character = character,
+							Highlight = highlight,
+							Billboard = billboard,
+							Text = text,
+						}
+						effects[p] = effect
+					end
+					effect.Highlight.FillColor = C[role]
+					effect.Highlight.OutlineColor = C[role]
+					effect.Text.TextColor3 = C[role]
+					effect.Text.Text = roleLabels[role] .. "\n" .. p.DisplayName
+				end
+			end
+		end
+	end
+	records = newRecords
+	local obsolete = {}
+	for p in pairs(effects) do
+		if not seen[p] then table.insert(obsolete, p) end
+	end
+	for _, p in ipairs(obsolete) do removeEffect(p) end
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+
+local function chooseTarget(camera, mode, ownCharacter)
+	local viewport = camera.ViewportSize
+	local center = viewport * 0.5
+	local bestDistance = math.min(CONFIG.RadioAim, math.min(viewport.X, viewport.Y) * 0.46)
+	local bestPlayer, bestPosition
+	rayParams.FilterDescendantsInstances = { ownCharacter, camera }
+
+	for p, record in pairs(records) do
+		local character = record.Character
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if p.Parent == Players and p.Character == character
+			and character:IsDescendantOf(Workspace)
+			and humanoid and humanoid.Health > 0
+			and (mode == "Knife" or record.Role == "Murder") then
+
+			local part = character:FindFirstChild("Head") or record.Root
+			if part and part:IsA("BasePart") then
+				local prediction = mode == "Gun" and CONFIG.PrediccionGun or CONFIG.PrediccionKnife
+				local position = part.Position + record.Root.AssemblyLinearVelocity * prediction
+				local projected, onScreen = camera:WorldToViewportPoint(position)
+				if onScreen and projected.Z > 0 then
+					local distance = (Vector2.new(projected.X, projected.Y) - center).Magnitude
+					if distance < bestDistance then
+						local visible = true
+						if CONFIG.ComprobarParedes then
+							local origin = camera.CFrame.Position
+							local hit = Workspace:Raycast(origin, part.Position - origin, rayParams)
+							visible = not hit or hit.Instance:IsDescendantOf(character)
+						end
+						if visible then
+							bestDistance = distance
+							bestPlayer, bestPosition = p, position
+						end
+					end
+				end
+			end
+		end
+	end
+	return bestPlayer, bestPosition
+end
+
+local elapsed, statusElapsed = CONFIG.IntervaloESP, 0
+local bindName = "HanselMM2Aim_" .. tostring(player.UserId)
+
+local function destroy()
+	if not alive then return end
+	alive = false
+	RunService:UnbindFromRenderStep(bindName)
+	for _, connection in ipairs(connections) do connection:Disconnect() end
+	table.clear(connections)
+	local list = {}
+	for p in pairs(effects) do table.insert(list, p) end
+	for _, p in ipairs(list) do removeEffect(p) end
+	table.clear(records)
+	if gui.Parent then gui:Destroy() end
+	if ENV[KEY] == runtime then ENV[KEY] = nil end
+end
+
+runtime.Destroy = destroy
+connect(shutdown.Event, destroy)
+connect(close.Activated, destroy)
+connect(gui.Destroying, destroy)
+connect(Players.PlayerRemoving, function(p)
+	removeEffect(p)
+	records[p] = nil
+end)
+
+connect(RunService.Heartbeat, function(dt)
+	elapsed += dt
+	if elapsed >= CONFIG.IntervaloESP then
+		elapsed = 0
+		refreshVisuals()
+	end
+end)
+
+RunService:UnbindFromRenderStep(bindName)
+RunService:BindToRenderStep(bindName, Enum.RenderPriority.Camera.Value + 1, function(dt)
+	if not alive then return end
+	local camera = Workspace.CurrentCamera
+	if not camera then return end
+
+	local viewport = camera.ViewportSize
+	scale.Scale = math.min(1, math.max(0.25,
+		math.min((viewport.X - 20) / 454, (viewport.Y - 28) / 420)))
+
+	local ownCharacter = livingCharacter(player)
+	local mode, target, targetPosition
+	local status = "Aim apagado · ESP basado en armas visibles."
+
+	if state.Gun or state.Knife then
+		status = "Equipa Gun o Knife · roles sin arma no confirmados."
+		if ownCharacter then
+			local equipped = weaponRole(ownCharacter)
+			if state.Gun and equipped == "Sheriff" then
+				mode = "Gun"
+			elseif state.Knife and equipped == "Murder" then
+				mode = "Knife"
+			end
+		else
+			status = "Esperando personaje vivo…"
+		end
+	end
+
+	if mode and ownCharacter then
+		target, targetPosition = chooseTarget(camera, mode, ownCharacter)
+		status = target and (mode .. " → " .. target.DisplayName .. " · ataque manual")
+			or (mode .. " · sin objetivo visible dentro del radio")
+		if targetPosition and not UIS:GetFocusedTextBox()
+			and camera.CameraType ~= Enum.CameraType.Scriptable then
+			local origin = camera.CFrame.Position
+			if (targetPosition - origin).Magnitude > 0.01 then
+				local alpha = 1 - math.exp(-CONFIG.Suavidad * math.min(dt, 0.1))
+				camera.CFrame = camera.CFrame:Lerp(CFrame.lookAt(origin, targetPosition), alpha)
+			end
+		end
+	end
+
+	statusElapsed += dt
+	if statusElapsed >= 0.15 then
+		statusElapsed = 0
+		footer.Text = status
+	end
+end)
+
+refreshVisuals()
