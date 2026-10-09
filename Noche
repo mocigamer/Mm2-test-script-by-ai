@@ -1,0 +1,181 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "GenesisTeAmo"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 500, 0, 400)
+MainFrame.Position = UDim2.new(0.5, -250, 0.5, -200)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 8)
+UICorner.Parent = MainFrame
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 40)
+Title.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+Title.Text = "Genesis te amo - MM2"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.TextSize = 18
+Title.Font = Enum.Font.GothamBold
+Title.Parent = MainFrame
+
+local TitleCorner = Instance.new("UICorner")
+TitleCorner.CornerRadius = UDim.new(0, 8)
+TitleCorner.Parent = Title
+
+local Settings = {
+    AimbotGun = false,
+    AimbotKnife = false,
+    EspMurder = false,
+    EspSheriff = false,
+    EspInnocent = false,
+    EspGun = false,
+    AutoShootMurder = false,
+    KillSheriff = false,
+    KillAll = false,
+    AutoPickGun = false,
+    HitboxSize = 2
+}
+
+local function getRole(player)
+    local character = player.Character
+    if not character then return "Innocent" end
+    
+    if character:FindFirstChild("Gun") or player.Backpack:FindFirstChild("Gun") then
+        if player == LocalPlayer and player.Character:FindFirstChild("Gun") and player.Character.Gun.Enabled then
+            return "Sheriff"
+        elseif not (character:FindFirstChild("Knife") or player.Backpack:FindFirstChild("Knife")) then
+            return "Sheriff"
+        end
+    end
+    if character:FindFirstChild("Knife") or player.Backpack:FindFirstChild("Knife") then
+        return "Murderer"
+    end
+    return "Innocent"
+end
+
+local function getMurderer()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local char = player.Character
+            if char and (char:FindFirstChild("Knife") or player.Backpack:FindFirstChild("Knife")) then
+                return player
+            end
+        end
+    end
+    return nil
+end
+
+local function getSheriff()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local char = player.Character
+            if char and (char:FindFirstChild("Gun") or player.Backpack:FindFirstChild("Gun")) then
+                return player
+            end
+        end
+    end
+    return nil
+end
+
+local shootButton = Instance.new("TextButton")
+shootButton.Size = UDim2.new(0, 50, 0, 50)
+shootButton.Position = UDim2.new(0.8, 0, 0.8, 0)
+shootButton.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+shootButton.Text = "🎯"
+shootButton.TextSize = 24
+shootButton.Visible = false
+shootButton.Active = true
+shootButton.Draggable = true
+shootButton.Parent = ScreenGui
+
+shootButton.MouseButton1Click:Connect(function()
+    if not Settings.AutoShootMurder then return end
+    local murderer = getMurderer()
+    if murderer and murderer.Character and murderer.Character:FindFirstChild("HumanoidRootPart") then
+        local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Gun")
+        if tool then
+            local args = {
+                [1] = 1,
+                [2] = murderer.Character.HumanoidRootPart.Position,
+                [3] = "AH"
+            }
+            tool.Shoot:FireServer(unpack(args))
+        end
+    end
+end)
+
+RunService.RenderStepped:Connect(function()
+    shootButton.Visible = Settings.AutoShootMurder
+
+    if Settings.HitboxSize > 2 then
+        local murderer = getMurderer()
+        if murderer and murderer.Character then
+            local hrp = murderer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.Size = Vector3.new(Settings.HitboxSize, Settings.HitboxSize, Settings.HitboxSize)
+                hrp.Transparency = 0.7
+                hrp.CanCollide = false
+            end
+        end
+    end
+
+    if Settings.AutoPickGun then
+        for _, obj in ipairs(workspace:GetChildren()) do
+            if obj.Name == "GunDrop" and obj:IsA("BasePart") and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                local dist = (LocalPlayer.Character.HumanoidRootPart.Position - obj.Position).Magnitude
+                if dist < 15 then
+                    firetouchinterest(LocalPlayer.Character.HumanoidRootPart, obj, 0)
+                    firetouchinterest(LocalPlayer.Character.HumanoidRootPart, obj, 1)
+                end
+            end
+        end
+    end
+
+    if Settings.AimbotGun then
+        local murderer = getMurderer()
+        if murderer and murderer.Character and murderer.Character:FindFirstChild("HumanoidRootPart") then
+            Camera.CFrame = CFrame.new(Camera.CFrame.Position, murderer.Character.HumanoidRootPart.Position)
+        end
+    end
+
+    if Settings.AimbotKnife then
+        local murderer = getMurderer()
+        if murderer and murderer.Character and murderer.Character:FindFirstChild("HumanoidRootPart") then
+            Camera.CFrame = CFrame.new(Camera.CFrame.Position, murderer.Character.HumanoidRootPart.Position)
+        end
+    end
+
+    if Settings.KillSheriff then
+        local sheriff = getSheriff()
+        local knife = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Knife")
+        if sheriff and sheriff.Character and sheriff.Character:FindFirstChild("HumanoidRootPart") and knife then
+            LocalPlayer.Character.HumanoidRootPart.CFrame = sheriff.Character.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
+            knife:Activate()
+        end
+    end
+
+    if Settings.KillAll then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+                local knife = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Knife")
+                if knife then
+                    LocalPlayer.Character.HumanoidRootPart.CFrame = player.Character.HumanoidRootPart.CFrame * CFrame.new(0, 0, 2)
+                    knife:Activate()
+                end
+            end
+        end
+    end
+end)
